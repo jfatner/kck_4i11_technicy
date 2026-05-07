@@ -15,17 +15,18 @@ class BulgarianSquatTrainer:
         self.tts_queue = queue.Queue()
         self.tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
         self.tts_thread.start()
-
-        self.state = "KALIBRACJA"
+        self.state = "KALIBRACJA"  # Zmieniono z POWITANIE na KALIBRACJA
         self.counter = 0
         self.current_rep_valid = True
         self.last_feedback_time = 0
-        self.feedback_cooldown = 2.0
+        self.feedback_cooldown = 1.5
+        self.is_greeting_done = False
         self.start_time = time.time()
         self.angle_up = 160
         self.angle_down = 95
+        self.active_side = None  # Do obsługi obu nóg
 
-        self.active_side = None
+        # ZROBIONE TODO: Zapis historii treningów (inicjalizacja pustej listy)
         self.trening_log = []
 
     def _tts_worker(self):
@@ -50,7 +51,9 @@ class BulgarianSquatTrainer:
 
     @staticmethod
     def calculate_angle(a, b, c):
-        a, b, c = np.array(a), np.array(b), np.array(c)
+        a = np.array(a)
+        b = np.array(b)
+        c = np.array(c)
         radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
         angle = np.abs(radians * 180.0 / np.pi)
         if angle > 180.0:
@@ -67,7 +70,7 @@ class BulgarianSquatTrainer:
 
     def run(self):
         cap = cv2.VideoCapture(0)
-        with self.mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7) as pose:
+        with self.mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
             while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret:
@@ -79,43 +82,35 @@ class BulgarianSquatTrainer:
                 image.flags.writeable = True
                 image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
-                h, w, _ = image.shape
                 progress_val = 0
                 current_error_msg = None
+                h, w, _ = image.shape
 
                 if results.pose_landmarks:
-                    landmarks = results.pose_landmarks.landmark
-
                     try:
-                        # 1. KALIBRACJA SYLWETKI
-                        if self.state == "KALIBRACJA":
-                            # Sprawdzamy czy widać kluczowe punkty
-                            required_joints = [
-                                self.mp_pose.PoseLandmark.LEFT_ANKLE, self.mp_pose.PoseLandmark.RIGHT_ANKLE,
-                                self.mp_pose.PoseLandmark.LEFT_KNEE, self.mp_pose.PoseLandmark.RIGHT_KNEE,
-                                self.mp_pose.PoseLandmark.LEFT_HIP, self.mp_pose.PoseLandmark.RIGHT_HIP
-                            ]
-                            is_visible = all(landmarks[j.value].visibility > 0.6 for j in required_joints)
+                        landmarks = results.pose_landmarks.landmark
 
-                            if is_visible:
-                                self.speak("Sylwetka wykryta. Rozpocznij ruch, aby wybrać nogę.")
+                        # ETAP: KALIBRACJA SYLWETKI
+                        if self.state == "KALIBRACJA":
+                            required = [self.mp_pose.PoseLandmark.LEFT_ANKLE, self.mp_pose.PoseLandmark.RIGHT_ANKLE,
+                                        self.mp_pose.PoseLandmark.LEFT_HIP, self.mp_pose.PoseLandmark.RIGHT_HIP]
+                            visible = all(landmarks[j.value].visibility > 0.5 for j in required)
+                            if visible:
                                 self.state = "POWITANIE"
                             else:
-                                current_error_msg = "Ustaw się tak, by było widać całe nogi"
+                                current_error_msg = "Pokaz cale nogi!"
 
-                        # 2. AUTOMATYCZNA DETEKCJA NOGI
+                        # DETEKCJA I OBSŁUGA OBU NÓG
                         if self.active_side is None:
-                            l_knee_y = landmarks[self.mp_pose.PoseLandmark.LEFT_KNEE.value].y
-                            r_knee_y = landmarks[self.mp_pose.PoseLandmark.RIGHT_KNEE.value].y
-                            if abs(l_knee_y - r_knee_y) > 0.05:  # Jeśli jedna noga jest wyraźnie niżej
-                                self.active_side = "LEFT" if l_knee_y > r_knee_y else "RIGHT"
-                                self.speak(f"Wykryto nogę {'lewą' if self.active_side == 'LEFT' else 'prawą'}")
-
+                            if landmarks[self.mp_pose.PoseLandmark.LEFT_KNEE.value].y > landmarks[self.mp_pose.PoseLandmark.RIGHT_KNEE.value].y + 0.05:
+                                self.active_side = "LEFT"
+                            elif landmarks[self.mp_pose.PoseLandmark.RIGHT_KNEE.value].y > landmarks[self.mp_pose.PoseLandmark.LEFT_KNEE.value].y + 0.05:
+                                self.active_side = "RIGHT"
+                        
                         side = self.active_side if self.active_side else "LEFT"
-
-                        # Pobieranie punktów dynamicznie
-                        shldr = [landmarks[getattr(self.mp_pose.PoseLandmark, f"{side}_SHOULDER").value].x,
-                                 landmarks[getattr(self.mp_pose.PoseLandmark, f"{side}_SHOULDER").value].y]
+                        
+                        shoulder = [landmarks[getattr(self.mp_pose.PoseLandmark, f"{side}_SHOULDER").value].x,
+                                    landmarks[getattr(self.mp_pose.PoseLandmark, f"{side}_SHOULDER").value].y]
                         hip = [landmarks[getattr(self.mp_pose.PoseLandmark, f"{side}_HIP").value].x,
                                landmarks[getattr(self.mp_pose.PoseLandmark, f"{side}_HIP").value].y]
                         knee = [landmarks[getattr(self.mp_pose.PoseLandmark, f"{side}_KNEE").value].x,
@@ -125,106 +120,120 @@ class BulgarianSquatTrainer:
                         toe = [landmarks[getattr(self.mp_pose.PoseLandmark, f"{side}_FOOT_INDEX").value].x,
                                landmarks[getattr(self.mp_pose.PoseLandmark, f"{side}_FOOT_INDEX").value].y]
 
-                        # Obliczenia
                         knee_angle = self.calculate_angle(hip, knee, ankle)
-                        torso_lean_angle = self.calculate_torso_lean(shldr, hip)
+                        torso_lean_angle = self.calculate_torso_lean(shoulder, hip)
 
-                        # Monitorowanie miednicy (różnica wysokości bioder)
-                        hip_l_y = landmarks[self.mp_pose.PoseLandmark.LEFT_HIP.value].y
-                        hip_r_y = landmarks[self.mp_pose.PoseLandmark.RIGHT_HIP.value].y
-                        hip_imbalance = abs(hip_l_y - hip_r_y)
+                        # MONITOROWANIE STABILNOŚCI MIEDNICY I KOŚLAWIENIA
+                        hip_l = landmarks[self.mp_pose.PoseLandmark.LEFT_HIP.value]
+                        hip_r = landmarks[self.mp_pose.PoseLandmark.RIGHT_HIP.value]
+                        hip_tilt = abs(hip_l.y - hip_r.y)
+                        knee_valgus = abs(knee[0] - (hip[0] + ankle[0])/2)
 
-                        # Koślawienie kolana (odchylenie kolana od linii biodro-kostka w osi X)
-                        knee_valgus = abs(knee[0] - (hip[0] + ankle[0]) / 2)
+                        ref_length = self.calculate_distance(shoulder, hip)
+                        if ref_length == 0:
+                            ref_length = 0.01
 
-                        ref_length = self.calculate_distance(shldr, hip)
-                        if ref_length == 0: ref_length = 0.01
+                        knee_ankle_x_diff_rel = abs(knee[0] - ankle[0]) / ref_length
                         distance_knee_toe_rel = abs(knee[0] - toe[0]) / ref_length
 
                         progress_val = np.interp(knee_angle, [self.angle_down, self.angle_up], [100, 0])
 
-                        # LOGIKA BŁĘDÓW
                         if self.state not in ["POWITANIE", "KALIBRACJA"]:
                             if torso_lean_angle > 45.0:
                                 current_error_msg = "Wyprostuj plecy!"
-                            elif hip_imbalance > 0.08:
-                                current_error_msg = "Trzymaj biodra równo!"
+                            elif hip_tilt > 0.08:
+                                current_error_msg = "Trzymaj biodra rowno!"
                             elif knee_valgus > 0.05:
-                                current_error_msg = "Kolano ucieka do środka!"
-                            elif self.state in ["W_DOL", "DOL"] and distance_knee_toe_rel > 0.25:
-                                current_error_msg = "Wydłuż krok!"
+                                current_error_msg = "Kolano do srodka!"
+                            elif knee_ankle_x_diff_rel > 0.3:
+                                current_error_msg = "Utrzymaj stabilne kolano!"
+                            elif self.state in ["W_DOL", "DOL"] and distance_knee_toe_rel > 0.2:
+                                current_error_msg = "Wydluz krok!"
 
                             if current_error_msg:
                                 self.current_rep_valid = False
-                                if time.time() - self.last_feedback_time > self.feedback_cooldown:
+                                current_time = time.time()
+                                if current_time - self.last_feedback_time > self.feedback_cooldown:
                                     self.speak(current_error_msg)
-                                    self.last_feedback_time = time.time()
+                                    self.last_feedback_time = current_time
 
-                        # MASZYNA STANÓW
                         if self.state == "POWITANIE":
-                            if time.time() - self.start_time > 2.0:
-                                self.speak("Zaczynamy trening!", force=True)
+                            if time.time() - self.start_time > 3.0 and not self.is_greeting_done:
+                                self.speak("Czesc! Ustaw sie do przysiadu bulgarskiego. Zaczynamy!", force=True)
+                                self.is_greeting_done = True
                                 self.state = "GORA"
-
                         elif self.state == "GORA":
                             if knee_angle < self.angle_up - 10:
                                 self.state = "W_DOL"
-
                         elif self.state == "W_DOL":
                             if knee_angle <= self.angle_down:
                                 self.state = "DOL"
-                                if self.current_rep_valid: self.speak("Góra!")
-
+                                if self.current_rep_valid:
+                                    self.speak("Dobry dol, teraz w gore!")
+                            elif knee_angle > self.angle_up:
+                                self.state = "GORA"
                         elif self.state == "DOL":
                             if knee_angle > self.angle_down + 10:
                                 self.state = "W_GORE"
-
                         elif self.state == "W_GORE":
                             if knee_angle >= self.angle_up:
                                 if self.current_rep_valid:
                                     self.counter += 1
-                                    self.speak(str(self.counter))
+                                    self.speak(f"Pieknie, {self.counter}")
                                     self.trening_log.append(
-                                        f"Powtórzenie {self.counter} ({side}) - OK - {time.strftime('%H:%M:%S')}")
+                                        f"Poprawne powtorzenie nr {self.counter} ({side}) o {time.strftime('%H:%M:%S')}")
                                 else:
-                                    self.speak("Powtórzenie spalone")
+                                    self.speak("Powtorzenie spalone. Skup sie i zacznij jeszcze raz.")
                                 self.current_rep_valid = True
                                 self.state = "GORA"
 
-                    except Exception as e:
+                    except Exception:
                         pass
 
                     self.mp_drawing.draw_landmarks(image, results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
 
-                # UI
-                cv2.rectangle(image, (0, 0), (320, 85), (245, 117, 16), -1)
-                cv2.putText(image, f'POWT: {self.counter}', (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-                cv2.putText(image, f'STAN: {self.state}', (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                cv2.putText(image, f'NOGA: {self.active_side if self.active_side else "SZUKAM..."}', (160, 35),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                cv2.rectangle(image, (0, 0), (300, 73), (245, 117, 16), -1)
+                cv2.putText(image, 'POWTORZENIA', (15, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+                cv2.putText(image, str(self.counter), (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 2,
+                            cv2.LINE_AA)
+                cv2.putText(image, 'FAZA RUCHU', (150, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+                cv2.putText(image, self.state, (150, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2,
+                            cv2.LINE_AA)
+
+                cv2.putText(image, 'CYBER-TRENER', (w - 200, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
+                            cv2.LINE_AA)
 
                 if current_error_msg:
-                    cv2.rectangle(image, (0, h - 40), (w, h), (0, 0, 255), -1)
-                    cv2.putText(image, current_error_msg, (w // 2 - 150, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                                (255, 255, 255), 2)
+                    cv2.putText(image, current_error_msg, (15, 120), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2,
+                                cv2.LINE_AA)
 
-                # Pasek postępu
-                bar_x = w - 50
-                cv2.rectangle(image, (bar_x, 100), (bar_x + 30, h - 100), (50, 50, 50), -1)
-                fill_h = int(np.interp(progress_val, [0, 100], [0, h - 200]))
-                col = (0, 255, 0) if self.current_rep_valid else (0, 0, 255)
-                cv2.rectangle(image, (bar_x, h - 100 - fill_h), (bar_x + 30, h - 100), col, -1)
+                bar_x = w - 60
+                bar_y_start = int(h * 0.2)
+                bar_y_end = int(h * 0.8)
+                bar_max_height = bar_y_end - bar_y_start
 
-                cv2.imshow('Cyber Trener Pro', image)
+                cv2.rectangle(image, (bar_x, bar_y_start), (bar_x + 30, bar_y_end), (50, 50, 50), -1)
+                cv2.rectangle(image, (bar_x, bar_y_start), (bar_x + 30, bar_y_end), (255, 255, 255), 2)
+
+                fill_height = int(bar_max_height * (progress_val / 100.0))
+                bar_color = (0, 0, 255) if not self.current_rep_valid else (0, 255, 0)
+
+                cv2.rectangle(image, (bar_x, bar_y_end - fill_height), (bar_x + 30, bar_y_end), bar_color, -1)
+                cv2.putText(image, f"{int(progress_val)}%", (bar_x - 50, bar_y_end - fill_height + 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+                cv2.imshow('Cyber Trener - Bulgarski Przysiad', image)
+
                 if cv2.waitKey(10) & 0xFF == ord('q'):
                     break
 
-        if self.counter > 0:
-            with open("historia_treningow.txt", "a", encoding='utf-8') as f:
-                f.write(f"\n--- Sesja: {time.strftime('%Y-%m-%d %H:%M')} ---\n")
-                for wpis in self.trening_log:
-                    f.write(wpis + "\n")
-                f.write(f"Łącznie: {self.counter} powtórzeń.\n")
+            # ZROBIONE TODO: Zapis statystyk do pliku txt tuż przed zamknięciem programu
+            if self.counter > 0:
+                with open("historia_treningow.txt", "a") as f:
+                    f.write(f"\n--- Trening z dnia {time.strftime('%Y-%m-%d')} ---\n")
+                    for wpis in self.trening_log:
+                        f.write(wpis + "\n")
+                    f.write(f"Zakonczono z wynikiem: {self.counter} powtorzen.\n")
 
         self.tts_queue.put(None)
         cap.release()
