@@ -64,16 +64,17 @@ class BulgarianSquatTrainer:
             angle = 360 - angle
         return angle
 
-    # Funkcja wygładzająca trzęsące się punkty (Exponential Moving Average)
-    def smooth_landmark(self, name, current_pt):
-        if name not in self.smoothed_landmarks:
-            self.smoothed_landmarks[name] = current_pt
+    # Zaktualizowana funkcja wygładzająca, zapamiętująca stronę ciała
+    def smooth_landmark(self, name, current_pt, side):
+        key = f"{side}_{name}"
+        if key not in self.smoothed_landmarks:
+            self.smoothed_landmarks[key] = current_pt
         else:
-            self.smoothed_landmarks[name] = [
-                self.alpha * current_pt[0] + (1 - self.alpha) * self.smoothed_landmarks[name][0],
-                self.alpha * current_pt[1] + (1 - self.alpha) * self.smoothed_landmarks[name][1]
+            self.smoothed_landmarks[key] = [
+                self.alpha * current_pt[0] + (1 - self.alpha) * self.smoothed_landmarks[key][0],
+                self.alpha * current_pt[1] + (1 - self.alpha) * self.smoothed_landmarks[key][1]
             ]
-        return self.smoothed_landmarks[name]
+        return self.smoothed_landmarks[key]
 
     def calculate_torso_lean(self, shoulder, hip):
         vertical_pt = [hip[0], hip[1] - 1.0]
@@ -83,8 +84,6 @@ class BulgarianSquatTrainer:
         cap = cv2.VideoCapture(0)  # 1 - kamera zewnetrzna 0 - wbudowana
 
         # ZWIĘKSZONA PEWNOŚĆ MODELU:
-        # min_tracking_confidence na 0.7 (zapobiega gubieniu kończyn przy dziwnych pozach)
-        # model_complexity=1 (możesz zmienić na 2, jeśli masz bardzo mocny komputer i nadal będzie gubić punkty)
         with self.mp_pose.Pose(min_detection_confidence=0.5,
                                min_tracking_confidence=0.7,
                                model_complexity=1) as pose:
@@ -111,12 +110,12 @@ class BulgarianSquatTrainer:
                     try:
                         landmarks = results.pose_landmarks.landmark
 
-                        # Sprawdzenie orientacji ciała
-                        left_hip = landmarks[self.mp_pose.PoseLandmark.LEFT_HIP.value]
-                        right_hip = landmarks[self.mp_pose.PoseLandmark.RIGHT_HIP.value]
+                        # Pobieramy punkty kostek do oceny, która noga jest na podłodze
+                        left_ankle_lm = landmarks[self.mp_pose.PoseLandmark.LEFT_ANKLE.value]
+                        right_ankle_lm = landmarks[self.mp_pose.PoseLandmark.RIGHT_ANKLE.value]
 
-                        # Wybór odpowiednich punktów w zależności od tego, którym bokiem stoimy do kamery
-                        if right_hip.z < left_hip.z:
+                        # Wybór odpowiednich punktów - noga z wyższym Y jest niżej na ekranie (czyli na podłodze)
+                        if right_ankle_lm.y > left_ankle_lm.y:
                             aktywna_noga = "PRAWA NOGA"
                             # Weryfikacja widoczności - zapobiega błędom, gdy obiektyw nie widzi np. stopy
                             if landmarks[self.mp_pose.PoseLandmark.RIGHT_HIP.value].visibility < 0.4 or \
@@ -147,10 +146,10 @@ class BulgarianSquatTrainer:
                                          landmarks[self.mp_pose.PoseLandmark.LEFT_ANKLE.value].y]
 
                         # Przepuszczenie punktów przez filtr wygładzający (likwidacja drgań kamery/modelu)
-                        shoulder = self.smooth_landmark("shoulder", raw_shoulder)
-                        hip = self.smooth_landmark("hip", raw_hip)
-                        knee = self.smooth_landmark("knee", raw_knee)
-                        ankle = self.smooth_landmark("ankle", raw_ankle)
+                        shoulder = self.smooth_landmark("shoulder", raw_shoulder, aktywna_noga)
+                        hip = self.smooth_landmark("hip", raw_hip, aktywna_noga)
+                        knee = self.smooth_landmark("knee", raw_knee, aktywna_noga)
+                        ankle = self.smooth_landmark("ankle", raw_ankle, aktywna_noga)
 
                         knee_angle = self.calculate_angle(hip, knee, ankle)
                         torso_lean_angle = self.calculate_torso_lean(shoulder, hip)
@@ -218,7 +217,7 @@ class BulgarianSquatTrainer:
 
                 cv2.putText(image, 'CYBER-TRENER', (w - 200, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
                             cv2.LINE_AA)
-                cv2.putText(image, f'SLEDZONA: {aktywna_noga}', (w - 200, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                cv2.putText(image, f'SLEDZONA: {aktywna_noga}', (w - 230, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                             (0, 255, 0), 1, cv2.LINE_AA)
 
                 if current_error_msg:
