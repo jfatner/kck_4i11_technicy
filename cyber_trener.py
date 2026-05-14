@@ -5,7 +5,6 @@ import pyttsx3
 import threading
 import time
 import queue
-import math
 
 
 class BulgarianSquatTrainer:
@@ -13,25 +12,27 @@ class BulgarianSquatTrainer:
         self.mp_drawing = mp.solutions.drawing_utils
         self.mp_pose = mp.solutions.pose
         self.tts_queue = queue.Queue()
+        self.is_speaking = False  
         self.tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
         self.tts_thread.start()
         self.state = "POWITANIE"
         self.counter = 0
         self.current_rep_valid = True
+        
+        # Koszyk błędów - wypowiemy je na koniec ruchu
+        self.errors_this_rep = set() 
+        
         self.last_feedback_time = 0
-        self.feedback_cooldown = 1.5
         self.is_greeting_done = False
         self.start_time = time.time()
 
-        # Płytszy przysiad (110 stopni) dla łatwiejszego zaliczenia ruchu
-        self.angle_up = 160
-        self.angle_down = 110
+        # Zmienione kąty na bardziej naturalne dla anatomii!
+        self.angle_up = 145    # Wyprost zaliczony już przy 145 stopniach (wcześniej 160)
+        self.angle_down = 110  # Głębokość przysiadu
 
         self.trening_log = []
-
-        # Inicjalizacja słownika do wygładzania ruchów (EMA filter)
         self.smoothed_landmarks = {}
-        self.alpha = 0.5  # Współczynnik wygładzania (0.1 - bardzo powolne, 0.9 - bardzo szybkie)
+        self.alpha = 0.5 
 
     def _tts_worker(self):
         try:
@@ -39,19 +40,30 @@ class BulgarianSquatTrainer:
             pythoncom.CoInitialize()
         except ImportError:
             pass
-        engine = pyttsx3.init()
-        engine.setProperty('rate', 160)
+        
         while True:
             text = self.tts_queue.get()
             if text is None:
                 break
-            engine.say(text)
-            engine.runAndWait()
+            
+            self.is_speaking = True 
+            try:
+                # Inicjalizacja co każde słowo zapobiega zacięciu pyttsx3 w tle
+                engine = pyttsx3.init()
+                engine.setProperty('rate', 160)
+                engine.say(text)
+                engine.runAndWait()
+                del engine
+            except Exception as e:
+                print(f"Blad glosu: {e}")
+                
+            self.is_speaking = False 
             self.tts_queue.task_done()
 
     def speak(self, text, force=False):
-        if self.tts_queue.empty() or force:
+        if (self.tts_queue.empty() and not self.is_speaking) or force:
             self.tts_queue.put(text)
+            print(f"[TRENER MÓWI]: {text}") # Wypisuje do konsoli, żebyś wiedział co się dzieje
 
     @staticmethod
     def calculate_angle(a, b, c):
@@ -64,7 +76,6 @@ class BulgarianSquatTrainer:
             angle = 360 - angle
         return angle
 
-    # Zaktualizowana funkcja wygładzająca, zapamiętująca stronę ciała
     def smooth_landmark(self, name, current_pt, side):
         key = f"{side}_{name}"
         if key not in self.smoothed_landmarks:
@@ -77,13 +88,13 @@ class BulgarianSquatTrainer:
         return self.smoothed_landmarks[key]
 
     def calculate_torso_lean(self, shoulder, hip):
-        vertical_pt = [hip[0], hip[1] - 1.0]
+        # Odniesienie pionowe musi być w pikselach (-100 pikseli w górę po osi Y)
+        vertical_pt = [hip[0], hip[1] - 100.0]
         return self.calculate_angle(shoulder, hip, vertical_pt)
 
     def run(self):
-        cap = cv2.VideoCapture(0)  # 1 - kamera zewnetrzna 0 - wbudowana
+        cap = cv2.VideoCapture(0)  
 
-        # ZWIĘKSZONA PEWNOŚĆ MODELU:
         with self.mp_pose.Pose(min_detection_confidence=0.5,
                                min_tracking_confidence=0.7,
                                model_complexity=1) as pose:
@@ -92,9 +103,7 @@ class BulgarianSquatTrainer:
                 if not ret:
                     break
 
-                # Odbicie lustrzane obrazu w poziomie
                 frame = cv2.flip(frame, 1)
-
                 image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 image.flags.writeable = False
                 results = pose.process(image)
@@ -102,7 +111,7 @@ class BulgarianSquatTrainer:
                 image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
                 progress_val = 0
-                current_error_msg = None
+                ui_error_msg = None 
                 h, w, _ = image.shape
                 aktywna_noga = "BRAK"
 
@@ -110,42 +119,39 @@ class BulgarianSquatTrainer:
                     try:
                         landmarks = results.pose_landmarks.landmark
 
-                        # Pobieramy punkty kostek do oceny, która noga jest na podłodze
                         left_ankle_lm = landmarks[self.mp_pose.PoseLandmark.LEFT_ANKLE.value]
                         right_ankle_lm = landmarks[self.mp_pose.PoseLandmark.RIGHT_ANKLE.value]
 
-                        # Wybór odpowiednich punktów - noga z wyższym Y jest niżej na ekranie (czyli na podłodze)
+                        # PRZELICZENIE NA PIKSELE - to rozwiązuje błąd matematyczny związany z prostokątnym ekranem!
                         if right_ankle_lm.y > left_ankle_lm.y:
                             aktywna_noga = "PRAWA NOGA"
-                            # Weryfikacja widoczności - zapobiega błędom, gdy obiektyw nie widzi np. stopy
                             if landmarks[self.mp_pose.PoseLandmark.RIGHT_HIP.value].visibility < 0.4 or \
                                     landmarks[self.mp_pose.PoseLandmark.RIGHT_KNEE.value].visibility < 0.4:
-                                raise ValueError("Punkty slabo widoczne")
+                                raise ValueError("slaba_widocznosc")
 
-                            raw_shoulder = [landmarks[self.mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x,
-                                            landmarks[self.mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
-                            raw_hip = [landmarks[self.mp_pose.PoseLandmark.RIGHT_HIP.value].x,
-                                       landmarks[self.mp_pose.PoseLandmark.RIGHT_HIP.value].y]
-                            raw_knee = [landmarks[self.mp_pose.PoseLandmark.RIGHT_KNEE.value].x,
-                                        landmarks[self.mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
-                            raw_ankle = [landmarks[self.mp_pose.PoseLandmark.RIGHT_ANKLE.value].x,
-                                         landmarks[self.mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
+                            raw_shoulder = [landmarks[self.mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x * w,
+                                            landmarks[self.mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y * h]
+                            raw_hip = [landmarks[self.mp_pose.PoseLandmark.RIGHT_HIP.value].x * w,
+                                       landmarks[self.mp_pose.PoseLandmark.RIGHT_HIP.value].y * h]
+                            raw_knee = [landmarks[self.mp_pose.PoseLandmark.RIGHT_KNEE.value].x * w,
+                                        landmarks[self.mp_pose.PoseLandmark.RIGHT_KNEE.value].y * h]
+                            raw_ankle = [landmarks[self.mp_pose.PoseLandmark.RIGHT_ANKLE.value].x * w,
+                                         landmarks[self.mp_pose.PoseLandmark.RIGHT_ANKLE.value].y * h]
                         else:
                             aktywna_noga = "LEWA NOGA"
                             if landmarks[self.mp_pose.PoseLandmark.LEFT_HIP.value].visibility < 0.4 or \
                                     landmarks[self.mp_pose.PoseLandmark.LEFT_KNEE.value].visibility < 0.4:
-                                raise ValueError("Punkty slabo widoczne")
+                                raise ValueError("slaba_widocznosc")
 
-                            raw_shoulder = [landmarks[self.mp_pose.PoseLandmark.LEFT_SHOULDER.value].x,
-                                            landmarks[self.mp_pose.PoseLandmark.LEFT_SHOULDER.value].y]
-                            raw_hip = [landmarks[self.mp_pose.PoseLandmark.LEFT_HIP.value].x,
-                                       landmarks[self.mp_pose.PoseLandmark.LEFT_HIP.value].y]
-                            raw_knee = [landmarks[self.mp_pose.PoseLandmark.LEFT_KNEE.value].x,
-                                        landmarks[self.mp_pose.PoseLandmark.LEFT_KNEE.value].y]
-                            raw_ankle = [landmarks[self.mp_pose.PoseLandmark.LEFT_ANKLE.value].x,
-                                         landmarks[self.mp_pose.PoseLandmark.LEFT_ANKLE.value].y]
+                            raw_shoulder = [landmarks[self.mp_pose.PoseLandmark.LEFT_SHOULDER.value].x * w,
+                                            landmarks[self.mp_pose.PoseLandmark.LEFT_SHOULDER.value].y * h]
+                            raw_hip = [landmarks[self.mp_pose.PoseLandmark.LEFT_HIP.value].x * w,
+                                       landmarks[self.mp_pose.PoseLandmark.LEFT_HIP.value].y * h]
+                            raw_knee = [landmarks[self.mp_pose.PoseLandmark.LEFT_KNEE.value].x * w,
+                                        landmarks[self.mp_pose.PoseLandmark.LEFT_KNEE.value].y * h]
+                            raw_ankle = [landmarks[self.mp_pose.PoseLandmark.LEFT_ANKLE.value].x * w,
+                                         landmarks[self.mp_pose.PoseLandmark.LEFT_ANKLE.value].y * h]
 
-                        # Przepuszczenie punktów przez filtr wygładzający (likwidacja drgań kamery/modelu)
                         shoulder = self.smooth_landmark("shoulder", raw_shoulder, aktywna_noga)
                         hip = self.smooth_landmark("hip", raw_hip, aktywna_noga)
                         knee = self.smooth_landmark("knee", raw_knee, aktywna_noga)
@@ -156,73 +162,81 @@ class BulgarianSquatTrainer:
 
                         progress_val = np.interp(knee_angle, [self.angle_down, self.angle_up], [100, 0])
 
-                        if self.state != "POWITANIE":
-                            # USUNĘLIŚMY restrykcje dla kolana - zostawiamy tylko skrajny opad tułowia (powyżej 75 stopni!)
-                            if torso_lean_angle > 75.0:
-                                current_error_msg = "Wyprostuj plecy!"
+                        # Wykrywanie błędu postawy
+                        if self.state not in ["POWITANIE", "GORA"]:
+                            # Znacznie niższy próg pochylenia, by łatwiej wyłapać błąd w warunkach domowych
+                            if torso_lean_angle > 35.0:
+                                self.current_rep_valid = False
+                                self.errors_this_rep.add("Wyprostuj plecy!")
+                                ui_error_msg = "Wyprostuj plecy!" 
 
-                        if current_error_msg:
-                            self.current_rep_valid = False
-                            current_time = time.time()
-                            if current_time - self.last_feedback_time > self.feedback_cooldown:
-                                self.speak(current_error_msg)
-                                self.last_feedback_time = current_time
-
+                        # --- PANZERNA MASZYNA STANÓW ---
                         if self.state == "POWITANIE":
                             if time.time() - self.start_time > 3.0 and not self.is_greeting_done:
                                 self.speak("Czesc! Ustaw sie do przysiadu bulgarskiego. Zaczynamy!", force=True)
                                 self.is_greeting_done = True
                                 self.state = "GORA"
+                                
                         elif self.state == "GORA":
                             if knee_angle < self.angle_up - 10:
                                 self.state = "W_DOL"
+                                
                         elif self.state == "W_DOL":
                             if knee_angle <= self.angle_down:
                                 self.state = "DOL"
-                                if self.current_rep_valid:
-                                    self.speak("Dobry dol, teraz w gore!")
-                            elif knee_angle > self.angle_up:
+                            elif knee_angle >= self.angle_up + 5:
+                                # Ktoś zrobił "półprzysiad" i wrócił do góry
+                                blad_msg = " ".join(self.errors_this_rep)
+                                self.speak(f"Niepelny przysiad! {blad_msg}", force=True)
                                 self.state = "GORA"
+                                self.current_rep_valid = True
+                                self.errors_this_rep.clear()
+                                
                         elif self.state == "DOL":
                             if knee_angle > self.angle_down + 10:
                                 self.state = "W_GORE"
+                                
                         elif self.state == "W_GORE":
                             if knee_angle >= self.angle_up:
+                                # POWRÓT DO GÓRY (Koniec pełnego powtórzenia)
                                 if self.current_rep_valid:
                                     self.counter += 1
-                                    self.speak(f"Pieknie, {self.counter}")
-                                    self.trening_log.append(
-                                        f"Poprawne powtorzenie nr {self.counter} o {time.strftime('%H:%M:%S')}")
+                                    self.speak(f"Pieknie, {self.counter}", force=True)
+                                    self.trening_log.append(f"Poprawne powtorzenie nr {self.counter} o {time.strftime('%H:%M:%S')}")
                                 else:
-                                    self.speak("Powtorzenie spalone. Skup sie i zacznij jeszcze raz.")
+                                    blad_msg = " ".join(self.errors_this_rep)
+                                    self.speak(f"Spalone. {blad_msg}", force=True)
+                                
                                 self.current_rep_valid = True
+                                self.errors_this_rep.clear()
                                 self.state = "GORA"
+                                
+                            elif knee_angle < self.angle_down + 5:
+                                # Przerwał wstawanie i znowu kuca - Reset z reprymendą!
+                                self.speak("Zepsuty ruch!", force=True)
+                                self.current_rep_valid = True
+                                self.errors_this_rep.clear()
+                                self.state = "DOL"
 
-                    except ValueError:
-                        # Przechwytuje moment, gdy kamera źle nas widzi - ignoruje klatkę bez niszczenia wyniku
-                        pass
+                    except ValueError as e:
+                        if str(e) == "slaba_widocznosc":
+                            ui_error_msg = "BRAK NOGI W KADRZE!"
                     except Exception as e:
-                        print(e)
                         pass
 
                 self.mp_drawing.draw_landmarks(image, results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
 
                 cv2.rectangle(image, (0, 0), (300, 73), (245, 117, 16), -1)
                 cv2.putText(image, 'POWTORZENIA', (15, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-                cv2.putText(image, str(self.counter), (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 2,
-                            cv2.LINE_AA)
+                cv2.putText(image, str(self.counter), (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 2, cv2.LINE_AA)
                 cv2.putText(image, 'FAZA RUCHU', (150, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-                cv2.putText(image, self.state, (150, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2,
-                            cv2.LINE_AA)
+                cv2.putText(image, self.state, (150, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
 
-                cv2.putText(image, 'CYBER-TRENER', (w - 200, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
-                            cv2.LINE_AA)
-                cv2.putText(image, f'SLEDZONA: {aktywna_noga}', (w - 230, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                            (0, 255, 0), 1, cv2.LINE_AA)
+                cv2.putText(image, 'CYBER-TRENER', (w - 200, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(image, f'SLEDZONA: {aktywna_noga}', (w - 230, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
 
-                if current_error_msg:
-                    cv2.putText(image, current_error_msg, (15, 120), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2,
-                                cv2.LINE_AA)
+                if ui_error_msg:
+                    cv2.putText(image, ui_error_msg, (15, 120), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
 
                 bar_x = w - 60
                 bar_y_start = int(h * 0.2)
@@ -234,7 +248,6 @@ class BulgarianSquatTrainer:
 
                 fill_height = int(bar_max_height * (progress_val / 100.0))
                 bar_color = (0, 0, 255) if not self.current_rep_valid else (0, 255, 0)
-
                 fill_height = max(0, min(fill_height, bar_max_height))
 
                 cv2.rectangle(image, (bar_x, bar_y_end - fill_height), (bar_x + 30, bar_y_end), bar_color, -1)
